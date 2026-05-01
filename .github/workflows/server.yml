@@ -3,11 +3,11 @@ name: Agent Server
 
 on:
   push:
-    branches: [main]
+    branches: [sam]
     tags:
       - "*" # Trigger on any tag (e.g., 1.0.0, 1.0.0a5, build-docker)
   pull_request:
-    branches: [main]
+    branches: [sam]
   workflow_dispatch:
     inputs:
       base_image:
