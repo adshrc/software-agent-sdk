@@ -1,4 +1,5 @@
 import atexit
+import contextlib
 import copy
 import uuid
 from collections.abc import Mapping
@@ -265,6 +266,7 @@ class LocalConversation(BaseConversation):
         # This ensures plugins are loaded before agent initialization
         self.llm_registry = LLMRegistry()
         self._profile_store = LLMProfileStore()
+        self._cipher = cipher
 
         # Initialize secrets if provided
         if secrets:
@@ -671,7 +673,7 @@ class LocalConversation(BaseConversation):
         try:
             cached = self.llm_registry.get(usage_id)
         except KeyError:
-            loaded = self._profile_store.load(profile_name)
+            loaded = self._profile_store.load(profile_name, cipher=self._cipher)
             cached = loaded.model_copy(update={"usage_id": usage_id})
         self.switch_llm(cached)
 
@@ -975,6 +977,9 @@ class LocalConversation(BaseConversation):
 
     def close(self) -> None:
         """Close the conversation and clean up all tool executors."""
+        # Remove the atexit reference so the conversation object can be GC'd
+        # after close. atexit.unregister is a no-op if not registered.
+        atexit.unregister(self.close)
         # Use getattr for safety - object may be partially constructed
         if getattr(self, "_cleanup_initiated", False):
             return
@@ -993,23 +998,20 @@ class LocalConversation(BaseConversation):
             self.agent.close()
         except Exception as e:
             logger.warning(f"Error closing agent: {e}")
-        if self.delete_on_close:
-            try:
-                tools_map = self.agent.tools_map
-            except (AttributeError, RuntimeError):
-                # Agent not initialized or partially constructed
-                return
-            for tool in tools_map.values():
-                try:
-                    executable_tool = tool.as_executable()
-                    executable_tool.executor.close()
-                except NotImplementedError:
-                    # Tool has no executor, skip it without erroring
-                    continue
-                except Exception as e:
-                    logger.warning(
-                        f"Error closing executor for tool '{tool.name}': {e}"
-                    )
+        # Always close tool executors — they hold runtime resources
+        # (subprocesses, connections, etc.) that must be released regardless
+        # of whether the conversation data is preserved (delete_on_close).
+        with contextlib.suppress(AttributeError, RuntimeError):
+            # Agent not initialized or partially constructed → skip
+            for tool in self.agent.tools_map.values():
+                with contextlib.suppress(NotImplementedError):
+                    try:
+                        executable_tool = tool.as_executable()
+                        executable_tool.executor.close()
+                    except Exception as e:
+                        logger.warning(
+                            f"Error closing executor for tool '{tool.name}': {e}"
+                        )
 
     def ask_agent(self, question: str) -> str:
         """Ask the agent a simple, stateless question and get a direct LLM response.

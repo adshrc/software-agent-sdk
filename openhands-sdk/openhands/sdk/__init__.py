@@ -26,6 +26,7 @@ from openhands.sdk.event.llm_convertible import MessageEvent
 from openhands.sdk.io import FileStore, LocalFileStore
 from openhands.sdk.llm import (
     LLM,
+    LLM_PROFILE_SCHEMA_VERSION,
     FallbackStrategy,
     ImageContent,
     LLMProfileStore,
@@ -48,8 +49,11 @@ from openhands.sdk.mcp import (
 )
 from openhands.sdk.plugin import Plugin
 from openhands.sdk.settings import (
+    ACP_PROVIDERS,
     ACPAgentSettings,
+    ACPProviderInfo,
     AgentSettings,
+    AgentSettingsBase,
     AgentSettingsConfig,
     CondenserSettings,
     ConversationSettings,
@@ -59,9 +63,12 @@ from openhands.sdk.settings import (
     SettingsSchema,
     SettingsSectionSchema,
     VerificationSettings,
+    build_session_model_meta,
     default_agent_settings,
+    detect_acp_provider_by_agent_name,
     export_agent_settings_schema,
     export_settings_schema,
+    get_acp_provider,
     validate_agent_settings,
 )
 
@@ -115,7 +122,7 @@ _print_banner(__version__)
 _DEPRECATED_SDK_EXPORTS: dict[str, dict[str, str]] = {
     "LLMAgentSettings": {
         "deprecated_in": "1.19.0",
-        "removed_in": "1.22.0",
+        "removed_in": "1.24.0",
         "details": (
             "Use ``OpenHandsAgentSettings`` directly. "
             "``LLMAgentSettings`` was renamed in v1.19.0."
@@ -144,6 +151,7 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "LLM",
+    "LLM_PROFILE_SCHEMA_VERSION",
     "LLMRegistry",
     "LLMProfileStore",
     "LLMStreamChunk",
@@ -183,13 +191,19 @@ __all__ = [
     "CondenserSettings",
     "ConversationSettings",
     "VerificationSettings",
+    "ACP_PROVIDERS",
     "ACPAgentSettings",
+    "ACPProviderInfo",
     "AgentSettings",
+    "AgentSettingsBase",
     "AgentSettingsConfig",
     "LLMAgentSettings",
     "OpenHandsAgentSettings",
+    "build_session_model_meta",
     "default_agent_settings",
+    "detect_acp_provider_by_agent_name",
     "export_agent_settings_schema",
+    "get_acp_provider",
     "validate_agent_settings",
     "SettingsChoice",
     "SettingProminence",

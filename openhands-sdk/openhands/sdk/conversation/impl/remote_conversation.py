@@ -37,6 +37,7 @@ from openhands.sdk.conversation.visualizer import (
     ConversationVisualizerBase,
     DefaultConversationVisualizer,
 )
+from openhands.sdk.event.acp_tool_call import ACPToolCallEvent
 from openhands.sdk.event.base import Event
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.event.conversation_state import (
@@ -59,18 +60,12 @@ from openhands.sdk.workspace import LocalWorkspace, RemoteWorkspace
 logger = get_logger(__name__)
 
 LEGACY_CONVERSATIONS_PATH = "/api/conversations"
-ACP_CONVERSATIONS_PATH = "/api/acp/conversations"
 
 
-def _uses_acp_conversation_contract(agent: AgentBase) -> bool:
-    return getattr(agent, "kind", agent.__class__.__name__) == "ACPAgent"
-
-
-def _conversation_contract_mismatch_message(conversation_id: ConversationID) -> str:
+def _agent_kind_mismatch_message(conversation_id: ConversationID) -> str:
     return (
-        f"Conversation {conversation_id} exists but is only available through the "
-        "ACP conversation contract. Attach with ACPAgent or use "
-        "/api/acp/conversations."
+        f"Conversation {conversation_id} was started with a different agent kind. "
+        "Attach with a matching agent type."
     )
 
 
@@ -259,6 +254,7 @@ class RemoteEventsList(EventsListBase):
         self._events_base_path = events_base_path
         self._cached_events: list[Event] = []
         self._cached_event_ids: set[str] = set()
+        self._acp_tool_call_id_to_event_id: dict[str, str] = {}
         self._lock = threading.RLock()
         # Initial fetch to sync existing events
         self._do_full_sync()
@@ -350,6 +346,37 @@ class RemoteEventsList(EventsListBase):
 
     def _add_event_unsafe(self, event: Event) -> None:
         """Add event to cache without acquiring lock (caller must hold lock)."""
+        # ACP streaming emits one ACPToolCallEvent per ToolCallProgress, each
+        # carrying the full cumulative stdout so far — O(n²) memory growth.
+        # Deduplicate by tool_call_id: replace the existing entry in-place so
+        # only the latest (most complete) snapshot is kept.
+        if isinstance(event, ACPToolCallEvent):
+            existing_id = self._acp_tool_call_id_to_event_id.get(event.tool_call_id)
+            if existing_id is not None:
+                for i, e in enumerate(self._cached_events):
+                    if e.id == existing_id:
+                        self._cached_events[i] = event
+                        self._cached_event_ids.discard(existing_id)
+                        self._cached_event_ids.add(event.id)
+                        self._acp_tool_call_id_to_event_id[event.tool_call_id] = (
+                            event.id
+                        )
+                        logger.debug(
+                            f"Replaced ACP tool call event {existing_id} -> {event.id} "
+                            f"(tool_call_id={event.tool_call_id})"
+                        )
+                        return
+                # Index pointed to an event that is no longer in _cached_events;
+                # clean up the stale entry so we don't carry it forward.
+                logger.warning(
+                    "Stale ACP tool-call index entry: "
+                    f"tool_call_id={event.tool_call_id} "
+                    f"pointed to event {existing_id} "
+                    "not found in _cached_events; removing stale entry."
+                )
+                self._cached_event_ids.discard(existing_id)
+                del self._acp_tool_call_id_to_event_id[event.tool_call_id]
+
         # Use bisect with key function for O(log N) insertion
         # This ensures events are always ordered correctly even if
         # WebSocket delivers them out of order
@@ -358,6 +385,8 @@ class RemoteEventsList(EventsListBase):
         )
         self._cached_events.insert(insert_pos, event)
         self._cached_event_ids.add(event.id)
+        if isinstance(event, ACPToolCallEvent):
+            self._acp_tool_call_id_to_event_id[event.tool_call_id] = event.id
         logger.debug(f"Added event {event.id} to local cache at position {insert_pos}")
 
     def add_event(self, event: Event) -> None:
@@ -671,11 +700,7 @@ class RemoteConversation(BaseConversation):
         self.max_iteration_per_run = max_iteration_per_run
         self.workspace = workspace
         self._client = workspace.client
-        self._conversation_info_base_path = (
-            ACP_CONVERSATIONS_PATH
-            if _uses_acp_conversation_contract(agent)
-            else LEGACY_CONVERSATIONS_PATH
-        )
+        self._conversation_info_base_path = LEGACY_CONVERSATIONS_PATH
         self._conversation_action_base_path = LEGACY_CONVERSATIONS_PATH
         self._cleanup_initiated = False
         self._terminal_status_queue: Queue[str] = Queue()
@@ -690,20 +715,14 @@ class RemoteConversation(BaseConversation):
                 acceptable_status_codes={404},
             )
             if resp.status_code == 404:
-                if not _uses_acp_conversation_contract(agent):
-                    acp_resp = _send_request(
-                        self._client,
-                        "GET",
-                        f"{ACP_CONVERSATIONS_PATH}/{conversation_id}",
-                        acceptable_status_codes={404},
-                    )
-                    if acp_resp.status_code != 404:
-                        raise ValueError(
-                            _conversation_contract_mismatch_message(conversation_id)
-                        )
                 # Conversation doesn't exist, we'll create it
                 should_create = True
             else:
+                agent_payload = resp.json().get("agent")
+                if agent_payload is not None:
+                    remote_agent = _validate_remote_agent(agent_payload)
+                    if remote_agent.agent_kind != agent.agent_kind:
+                        raise ValueError(_agent_kind_mismatch_message(conversation_id))
                 # Conversation exists, use the provided ID
                 self._id = conversation_id
 

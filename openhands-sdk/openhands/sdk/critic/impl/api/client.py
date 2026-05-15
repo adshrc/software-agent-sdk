@@ -13,9 +13,14 @@ from pydantic import (
     field_serializer,
     field_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-from openhands.sdk.utils.pydantic_secrets import serialize_secret, validate_secret
+from openhands.sdk.utils.pydantic_secrets import (
+    is_redacted_secret,
+    serialize_secret,
+    validate_secret,
+)
 
 from .chat_template import ChatTemplateRenderer
 
@@ -66,6 +71,10 @@ class LabelProbMap(BaseModel):
 # ============================================================
 
 
+DEFAULT_CRITIC_SERVER_URL = "https://llm-proxy.app.all-hands.dev/vllm"
+DEFAULT_CRITIC_MODEL_NAME = "critic"
+
+
 class CriticClient(BaseModel):
     """
     Core inference client for the Critic classification service.
@@ -86,14 +95,17 @@ class CriticClient(BaseModel):
 
     # --- connection / model config ---
     server_url: str = Field(
-        default="https://all-hands-ai--critic-qwen3-4b-serve.modal.run",
+        default=DEFAULT_CRITIC_SERVER_URL,
         description="Base URL of the vLLM classification service",
     )
-    api_key: str | SecretStr = Field(
+    # validate_secret() normalizes empty, whitespace-only, and redacted inputs
+    # to None. That value may serialize as null during response-model rebuilds,
+    # but it is not part of the public REST schema contract.
+    api_key: str | SecretStr | SkipJsonSchema[None] = Field(
         ..., description="API key for authenticating with the vLLM service"
     )
     model_name: str = Field(
-        default="critic-qwen3-4b", description="Name of the model to use"
+        default=DEFAULT_CRITIC_MODEL_NAME, description="Name of the model to use"
     )
     tokenizer_name: str = Field(
         default="Qwen/Qwen3-4B-Instruct-2507",
@@ -159,16 +171,15 @@ class CriticClient(BaseModel):
     # ---------------------
     @field_validator("api_key", mode="before")
     @classmethod
-    def _validate_and_convert_api_key(cls, v: str | SecretStr, info) -> SecretStr:
+    def _validate_and_convert_api_key(
+        cls, v: str | SecretStr | None, info
+    ) -> SecretStr | None:
         """Validate api_key and decrypt it when needed."""
-        secret = validate_secret(v, info)
-        if secret is None:
-            raise ValueError("api_key must be non-empty")
-        return secret
+        return validate_secret(v, info)
 
     @field_serializer("api_key", when_used="always")
-    def _serialize_api_key(self, v: str | SecretStr, info):
-        secret = v if isinstance(v, SecretStr) else SecretStr(v)
+    def _serialize_api_key(self, v: str | SecretStr | None, info):
+        secret = v if v is None or isinstance(v, SecretStr) else SecretStr(v)
         return serialize_secret(secret, info)
 
     # ---------------------
@@ -236,6 +247,18 @@ class CriticClient(BaseModel):
     # ---------------------
     # Inference
     # ---------------------
+    def _get_api_key_value(self) -> str:
+        if self.api_key is None:
+            raise ValueError("api_key must be non-empty")
+        api_key_value = (
+            self.api_key.get_secret_value()
+            if isinstance(self.api_key, SecretStr)
+            else self.api_key
+        )
+        if not api_key_value.strip() or is_redacted_secret(api_key_value):
+            raise ValueError("api_key must be non-empty")
+        return api_key_value
+
     def classify_trace(
         self,
         messages: Sequence[dict],
@@ -259,11 +282,7 @@ class CriticClient(BaseModel):
             reraise=True,  # re-raise the last exception if all retries fail
         )
         def _post_with_retry():
-            api_key_value = (
-                self.api_key.get_secret_value()
-                if isinstance(self.api_key, SecretStr)
-                else self.api_key
-            )
+            api_key_value = self._get_api_key_value()
             resp = self._client.post(
                 f"{self.server_url}/classify",
                 headers={

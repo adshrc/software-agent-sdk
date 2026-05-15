@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,9 +25,15 @@ from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
 )
-from openhands.sdk.event import AgentErrorEvent, StreamingDeltaEvent
+from openhands.sdk.event import (
+    AgentErrorEvent,
+    ObservationBaseEvent,
+    StreamingDeltaEvent,
+)
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
 from openhands.sdk.event.llm_completion_log import LLMCompletionLogEvent
+from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
+from openhands.sdk.git.utils import run_git_command, validate_git_repository
 from openhands.sdk.llm.streaming import LLMStreamChunk
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
@@ -36,6 +43,9 @@ from openhands.sdk.workspace import LocalWorkspace
 
 
 LEASE_RENEW_INTERVAL_SECONDS = 15.0
+# Bounds initial-state push so subscribe_to_events does not stall on a
+# subscriber whose __call__ blocks (e.g. WS with a full TCP send buffer).
+INITIAL_STATE_PUSH_TIMEOUT_SECONDS = 0.5
 
 
 logger = get_logger(__name__)
@@ -53,13 +63,17 @@ class EventService:
     cipher: Cipher | None = None
     owner_instance_id: str = field(default_factory=lambda: uuid4().hex)
     _conversation: LocalConversation | None = field(default=None, init=False)
-    _pub_sub: PubSub[Event] = field(default_factory=lambda: PubSub[Event](), init=False)
+    _pub_sub: PubSub[Event] = field(
+        default_factory=lambda: PubSub[Event](max_subscribers=50), init=False
+    )
     _run_task: asyncio.Task | None = field(default=None, init=False)
     _run_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _callback_wrapper: AsyncCallbackWrapper | None = field(default=None, init=False)
     _lease: ConversationLease | None = field(default=None, init=False)
     _lease_generation: int | None = field(default=None, init=False)
     _lease_task: asyncio.Task | None = field(default=None, init=False)
+    _external_lease_renewal: bool = field(default=False, init=False)
+    _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
 
     @property
     def conversation_dir(self):
@@ -90,15 +104,16 @@ class EventService:
             return nullcontext()
         return self._lease.guarded_write(self._lease_generation)
 
-    async def _renew_lease_loop(self) -> None:
+    def renew_lease(self) -> None:
+        """Renew this service's conversation lease.
+
+        Called by a centralized renewal loop (when ``_external_lease_renewal``
+        is True) or by the per-service ``_renew_lease_loop`` background task.
+        """
         if self._lease is None or self._lease_generation is None:
             return
         try:
-            while True:
-                await asyncio.sleep(LEASE_RENEW_INTERVAL_SECONDS)
-                self._lease.renew(self._lease_generation)
-        except asyncio.CancelledError:
-            raise
+            self._lease.renew(self._lease_generation)
         except ConversationOwnershipLostError:
             logger.warning(
                 "Conversation lease lost while renewing: %s",
@@ -109,6 +124,16 @@ class EventService:
                 "Failed to renew conversation lease for %s",
                 self.stored.id,
             )
+
+    async def _renew_lease_loop(self) -> None:
+        if self._lease is None or self._lease_generation is None:
+            return
+        try:
+            while True:
+                await asyncio.sleep(LEASE_RENEW_INTERVAL_SECONDS)
+                self.renew_lease()
+        except asyncio.CancelledError:
+            raise
 
     def get_conversation(self):
         if not self._conversation:
@@ -134,6 +159,33 @@ class EventService:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._get_event_sync, event_id)
 
+    def _event_matches_filters(
+        self,
+        event: Event,
+        kind: str | None,
+        source: str | None,
+        body: str | None,
+        timestamp_gte_str: str | None,
+        timestamp_lt_str: str | None,
+    ) -> bool:
+        """Return True if ``event`` matches all of the provided filters."""
+        if (
+            kind is not None
+            and f"{event.__class__.__module__}.{event.__class__.__name__}" != kind
+        ):
+            return False
+        if source is not None and event.source != source:
+            return False
+        if timestamp_gte_str is not None and event.timestamp < timestamp_gte_str:
+            return False
+        if timestamp_lt_str is not None and event.timestamp >= timestamp_lt_str:
+            return False
+        # ``body`` is the most expensive filter (deserializes message content),
+        # so evaluate it last.
+        if body is not None and not self._event_matches_body(event, body):
+            return False
+        return True
+
     def _search_events_sync(
         self,
         page_id: str | None = None,
@@ -150,67 +202,68 @@ class EventService:
         Reads directly from the EventLog without acquiring the state lock.
         EventLog reads are safe without the FIFOLock because events are
         append-only and immutable once written.
+
+        Performance:
+            Events are appended in chronological order and never reordered,
+            so the on-disk index order matches the timestamp sort order.
+            We exploit that by iterating the underlying ``Sequence`` lazily
+            by index (forward for TIMESTAMP, backward for TIMESTAMP_DESC),
+            stopping as soon as we have ``limit + 1`` filter matches.
+
+            This turns ``search_events`` from O(N) disk reads + O(N log N)
+            sort into O(limit + skipped) reads with no sort, which is the
+            difference between "loads instantly" and "blocks for seconds"
+            for long conversations.
         """
         if not self._conversation:
             raise ValueError("inactive_service")
+
+        events = self._conversation._state.events
+        total = len(events)
 
         # Convert datetime to ISO string for comparison (ISO strings are comparable)
         timestamp_gte_str = timestamp__gte.isoformat() if timestamp__gte else None
         timestamp_lt_str = timestamp__lt.isoformat() if timestamp__lt else None
 
-        # Collect all events
-        all_events = []
-        for event in self._conversation._state.events:
-            # Apply kind filter if provided
-            if (
-                kind is not None
-                and f"{event.__class__.__module__}.{event.__class__.__name__}" != kind
+        reverse = sort_order == EventSortOrder.TIMESTAMP_DESC
+
+        # Resolve page_id to a starting index. Prefer the EventLog's O(1)
+        # id-to-index map; fall back to a linear scan for plain sequences
+        # (e.g. in tests). An unknown page_id falls back to the natural
+        # start of the iteration order, matching prior behavior.
+        start_index: int | None = None
+        if page_id:
+            get_index = getattr(events, "get_index", None)
+            if get_index is not None:
+                try:
+                    start_index = get_index(page_id)
+                except KeyError:
+                    start_index = None
+            else:
+                for i in range(total):
+                    if events[i].id == page_id:
+                        start_index = i
+                        break
+        if start_index is None:
+            start_index = total - 1 if reverse else 0
+
+        if reverse:
+            indices: range = range(start_index, -1, -1)
+        else:
+            indices = range(start_index, total)
+
+        items: list[Event] = []
+        next_page_id: str | None = None
+        for i in indices:
+            event = events[i]
+            if not self._event_matches_filters(
+                event, kind, source, body, timestamp_gte_str, timestamp_lt_str
             ):
                 continue
-
-            # Apply source filter if provided
-            if source is not None and event.source != source:
-                continue
-
-            # Apply body filter if provided (case-insensitive substring match)
-            if body is not None:
-                if not self._event_matches_body(event, body):
-                    continue
-
-            # Apply timestamp filters if provided (ISO string comparison)
-            if timestamp_gte_str is not None and event.timestamp < timestamp_gte_str:
-                continue
-            if timestamp_lt_str is not None and event.timestamp >= timestamp_lt_str:
-                continue
-
-            all_events.append(event)
-
-        # Sort events based on sort_order
-        if sort_order == EventSortOrder.TIMESTAMP:
-            all_events.sort(key=lambda x: x.timestamp)
-        elif sort_order == EventSortOrder.TIMESTAMP_DESC:
-            all_events.sort(key=lambda x: x.timestamp, reverse=True)
-
-        # Handle pagination
-        items = []
-        start_index = 0
-
-        # Find the starting point if page_id is provided
-        if page_id:
-            for i, event in enumerate(all_events):
-                if event.id == page_id:
-                    start_index = i
-                    break
-
-        # Collect items for this page
-        next_page_id = None
-        for i in range(start_index, len(all_events)):
             if len(items) >= limit:
-                # We have more items, set next_page_id
-                if i < len(all_events):
-                    next_page_id = all_events[i].id
+                next_page_id = event.id
                 break
-            items.append(all_events[i])
+            items.append(event)
 
         return EventPage(items=items, next_page_id=next_page_id)
 
@@ -258,36 +311,29 @@ class EventService:
         if not self._conversation:
             raise ValueError("inactive_service")
 
+        events = self._conversation._state.events
+
+        # Fast path: with no filters, the count is just the sequence length
+        # and we can avoid reading any event payloads from disk.
+        if (
+            kind is None
+            and source is None
+            and body is None
+            and timestamp__gte is None
+            and timestamp__lt is None
+        ):
+            return len(events)
+
         # Convert datetime to ISO string for comparison (ISO strings are comparable)
         timestamp_gte_str = timestamp__gte.isoformat() if timestamp__gte else None
         timestamp_lt_str = timestamp__lt.isoformat() if timestamp__lt else None
 
         count = 0
-        for event in self._conversation._state.events:
-            # Apply kind filter if provided
-            if (
-                kind is not None
-                and f"{event.__class__.__module__}.{event.__class__.__name__}" != kind
+        for event in events:
+            if self._event_matches_filters(
+                event, kind, source, body, timestamp_gte_str, timestamp_lt_str
             ):
-                continue
-
-            # Apply source filter if provided
-            if source is not None and event.source != source:
-                continue
-
-            # Apply body filter if provided (case-insensitive substring match)
-            if body is not None:
-                if not self._event_matches_body(event, body):
-                    continue
-
-            # Apply timestamp filters if provided (ISO string comparison)
-            if timestamp_gte_str is not None and event.timestamp < timestamp_gte_str:
-                continue
-            if timestamp_lt_str is not None and event.timestamp >= timestamp_lt_str:
-                continue
-
-            count += 1
-
+                count += 1
         return count
 
     async def count_events(
@@ -372,26 +418,9 @@ class EventService:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conversation.send_message, message)
         if run:
-            run = (
-                await self._get_execution_status()
-                != ConversationExecutionStatus.RUNNING
-            )
-        if run:
-            conversation = self._conversation
-
-            async def _run_with_error_handling():
-                try:
-                    await loop.run_in_executor(None, conversation.run)
-                except Exception:
-                    logger.exception("Error during conversation run from send_message")
-
-            # Fire-and-forget: This task is intentionally not tracked because
-            # send_message() is designed to return immediately after queuing the
-            # message. The conversation run happens in the background and any
-            # errors are logged. Unlike the run() method which is explicitly
-            # awaited, this pattern allows clients to send messages without
-            # blocking on the full conversation execution.
-            loop.create_task(_run_with_error_handling())
+            # Already running or inactive — message was sent, skip run.
+            with suppress(ValueError):
+                await self.run()
 
     async def subscribe_to_events(self, subscriber: Subscriber[Event]) -> UUID:
         subscriber_id = self._pub_sub.subscribe(subscriber)
@@ -403,11 +432,19 @@ class EventService:
             state_update_event = await self._create_state_update_event()
 
             try:
-                await subscriber(state_update_event)
-            except Exception as e:
-                logger.error(
-                    f"Error sending initial state to subscriber {subscriber_id}: {e}"
+                await asyncio.wait_for(
+                    subscriber(state_update_event),
+                    timeout=INITIAL_STATE_PUSH_TIMEOUT_SECONDS,
                 )
+            except TimeoutError:
+                # Subscriber stays registered; only the initial-state push is
+                # dropped. Subsequent publishes go through pub_sub and may
+                # still block there if the subscriber remains wedged.
+                logger.warning(
+                    f"Initial state push to subscriber {subscriber_id} timed "
+                    f"out after {INITIAL_STATE_PUSH_TIMEOUT_SECONDS}s."
+                )
+            # Non-timeout errors propagate to caller (e.g. webhook failures).
 
         return subscriber_id
 
@@ -497,6 +534,34 @@ class EventService:
         for llm in agent.get_all_llms():
             llm.telemetry.set_stats_update_callback(stats_callback)
 
+    @staticmethod
+    def _ensure_workspace_is_git_repo(working_dir: Path) -> None:
+        """Initialize the workspace as a git repo if it isn't already one.
+
+        The /api/git/changes endpoint expects a real repository to compute
+        changes against; without this, agent-created files never appear in
+        the Changes tab. We only run `git init` (no commit) — empty repos
+        are handled by `get_valid_ref()` via GIT_EMPTY_TREE_HASH, and
+        untracked files surface through `git ls-files --others`.
+        """
+        try:
+            validate_git_repository(working_dir)
+            return  # already a repo
+        except GitRepositoryError:
+            logger.debug(
+                "Workspace %s is not a git repository; running `git init`",
+                working_dir,
+            )
+
+        try:
+            run_git_command(["git", "init"], working_dir)
+        except GitCommandError as e:
+            # Don't block conversation startup if git is missing or init
+            # fails — the git router is defensive and will return [] anyway.
+            logger.warning(
+                "Failed to initialize git repository at %s: %s", working_dir, e
+            )
+
     async def start(self):
         # Store the main event loop for cross-thread communication
         self._main_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
@@ -511,7 +576,9 @@ class EventService:
         self._lease_generation = lease_claim.generation
         workspace = self.stored.workspace
         assert isinstance(workspace, LocalWorkspace)
-        Path(workspace.working_dir).mkdir(parents=True, exist_ok=True)
+        working_dir = Path(workspace.working_dir)
+        working_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_workspace_is_git_repo(working_dir)
         agent_cls = type(self.stored.agent)
         agent = agent_cls.model_validate(
             self.stored.agent.model_dump(context={"expose_secrets": True}),
@@ -532,7 +599,7 @@ class EventService:
         # the wiring lets us log the decision so operators can tell from a
         # log line whether deltas will flow.
         streaming_enabled = any(llm.stream for llm in agent.get_all_llms())
-        logger.info(
+        logger.debug(
             "Token streaming: %s",
             "enabled" if streaming_enabled else "disabled (no LLM has stream=True)",
         )
@@ -584,7 +651,8 @@ class EventService:
         conversation.set_security_analyzer(self.stored.security_analyzer)
         self._conversation = conversation
         self._conversation._state.set_write_guard(self._write_guard)
-        self._lease_task = asyncio.create_task(self._renew_lease_loop())
+        if not self._external_lease_renewal:
+            self._lease_task = asyncio.create_task(self._renew_lease_loop())
 
         # Register state change callback to automatically publish updates
         self._conversation._state.set_on_state_change(self._conversation._on_event)
@@ -611,16 +679,25 @@ class EventService:
             unmatched_actions = ConversationState.get_unmatched_actions(state.events)
             if unmatched_actions:
                 first_action = unmatched_actions[0]
-                error_event = AgentErrorEvent(
-                    tool_name=first_action.tool_name,
-                    tool_call_id=first_action.tool_call_id,
-                    error=(
-                        "A restart occurred while this tool was in progress. "
-                        "This may indicate a fatal memory error or system crash. "
-                        "The tool execution was interrupted and did not complete."
-                    ),
+                # Skip if any observation-like event already exists for this
+                # tool_call_id, to avoid duplicate observations when an
+                # observation matches by tool_call_id but not action_id.
+                already_observed = any(
+                    isinstance(e, ObservationBaseEvent)
+                    and e.tool_call_id == first_action.tool_call_id
+                    for e in state.events
                 )
-                self._conversation._on_event(error_event)
+                if not already_observed:
+                    error_event = AgentErrorEvent(
+                        tool_name=first_action.tool_name,
+                        tool_call_id=first_action.tool_call_id,
+                        error=(
+                            "A restart occurred while this tool was in progress. "
+                            "This may indicate a fatal memory error or system crash. "
+                            "The tool execution was interrupted and did not complete."
+                        ),
+                    )
+                    self._conversation._on_event(error_event)
 
         # Publish initial state update
         await self._publish_state_update()
@@ -658,7 +735,7 @@ class EventService:
 
             async def _run_and_publish():
                 try:
-                    await loop.run_in_executor(None, conversation.run)
+                    await loop.run_in_executor(self._run_executor, conversation.run)
                 except Exception:
                     logger.exception("Error during conversation run")
                 finally:
@@ -743,6 +820,23 @@ class EventService:
             with suppress(asyncio.CancelledError):
                 await self._lease_task
             self._lease_task = None
+
+        # Drain in-flight run before teardown so MCP close doesn't race
+        # with a tool call mid-step.
+        if self._run_task is not None and not self._run_task.done():
+            if self._conversation is not None:
+                loop = asyncio.get_running_loop()
+                try:
+                    await loop.run_in_executor(None, self._conversation.pause)
+                except Exception:
+                    logger.warning(
+                        "Failed to pause conversation during close", exc_info=True
+                    )
+            try:
+                await asyncio.wait_for(self._run_task, timeout=10.0)
+            except Exception as exc:
+                logger.warning("Run task did not exit cleanly during close: %s", exc)
+            self._run_task = None
 
         await self._pub_sub.close()
         if self._conversation:

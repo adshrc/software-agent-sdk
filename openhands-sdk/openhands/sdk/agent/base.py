@@ -7,7 +7,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -473,30 +473,31 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
                 result = future.result()
                 tools.extend(result)
 
-        logger.info(
-            f"Loaded {len(tools)} tools from spec: {[tool.name for tool in tools]}"
-        )
+        logger.info("Loaded %d tools from spec", len(tools))
         if self.filter_tools_regex:
             pattern = re.compile(self.filter_tools_regex)
             tools = [tool for tool in tools if pattern.match(tool.name)]
-            logger.info(
-                f"Filtered to {len(tools)} tools after applying regex filter: "
-                f"{[tool.name for tool in tools]}",
-            )
+            logger.info("Filtered to %d tools after applying regex filter", len(tools))
 
         # Include default tools from include_default_tools; not subject to regex
         # filtering. Use explicit mapping to resolve tool class names.
         # Auto-attach `InvokeSkillTool` iff an AgentSkills-format skill is
-        # loaded and the user hasn't already opted in explicitly.
-        has_agentskills = bool(
+        # directly invocable and the user hasn't already opted in explicitly.
+        has_invocable_agentskills = bool(
             self.agent_context
-            and any(s.is_agentskills_format for s in self.agent_context.skills)
+            and any(
+                s.is_agentskills_format and not s.disable_model_invocation
+                for s in self.agent_context.skills
+            )
         )
         default_tool_names = list(self.include_default_tools)
-        if has_agentskills and InvokeSkillTool.__name__ not in default_tool_names:
+        if (
+            has_invocable_agentskills
+            and InvokeSkillTool.__name__ not in default_tool_names
+        ):
             default_tool_names.append(InvokeSkillTool.__name__)
             logger.debug(
-                "Auto-attached %s (AgentSkills-format skill present in agent_context)",
+                "Auto-attached %s (invocable AgentSkills-format skill present)",
                 InvokeSkillTool.__name__,
             )
 
@@ -708,6 +709,43 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         if not self._initialized:
             raise RuntimeError("Agent not initialized; call _initialize() before use")
         return self._tools
+
+    # -- Capability helpers -----------------------------------------------
+    # Downstream code should branch on these properties rather than doing
+    # ``isinstance(agent, ACPAgent)`` checks.  That keeps the regular/ACP
+    # code paths decoupled from the concrete class hierarchy.
+
+    @property
+    def supports_openhands_tools(self) -> bool:
+        """``True`` if OpenHands can inject tools into this agent.
+
+        ``False`` for :class:`~openhands.sdk.agent.acp_agent.ACPAgent` — the
+        ACP server manages its own toolset.
+        """
+        return True
+
+    @property
+    def supports_openhands_mcp(self) -> bool:
+        """``True`` if OpenHands can inject MCP servers into this agent.
+
+        ``False`` for :class:`~openhands.sdk.agent.acp_agent.ACPAgent` — MCP
+        configuration is owned by the ACP subprocess.
+        """
+        return True
+
+    @property
+    def supports_condenser(self) -> bool:
+        """``True`` if OpenHands context condensing is supported for this agent.
+
+        ``False`` for :class:`~openhands.sdk.agent.acp_agent.ACPAgent` — the
+        ACP server manages its own context window.
+        """
+        return True
+
+    @property
+    def agent_kind(self) -> Literal["openhands", "acp"]:
+        """Agent kind, matching the ``agent_kind`` settings discriminator."""
+        return "openhands"
 
     def ask_agent(self, question: str) -> str | None:  # noqa: ARG002
         """Optional override for stateless question answering.

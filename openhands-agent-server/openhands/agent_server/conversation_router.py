@@ -3,13 +3,23 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from pydantic import SecretStr
 
-from openhands.agent_server.conversation_service import (
-    ConversationContractMismatchError,
-    ConversationService,
+from openhands.agent_server._secrets_exposure import (
+    decrypt_incoming_llm_secrets,
+    get_cipher,
 )
+from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.models import (
     AgentResponseResult,
@@ -149,10 +159,7 @@ async def batch_get_conversations(
 # Write Methods
 
 
-@conversation_router.post(
-    "",
-    responses={409: {"description": "Conversation contract mismatch"}},
-)
+@conversation_router.post("")
 async def start_conversation(
     request: Annotated[
         StartConversationRequest, Body(examples=START_CONVERSATION_EXAMPLES)
@@ -161,13 +168,7 @@ async def start_conversation(
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationInfo:
     """Start a conversation in the local environment."""
-    try:
-        info, is_new = await conversation_service.start_conversation(request)
-    except ConversationContractMismatchError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(e),
-        ) from e
+    info, is_new = await conversation_service.start_conversation(request)
     response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
     return info
 
@@ -324,6 +325,7 @@ async def switch_conversation_profile(
     responses={404: {"description": "Conversation not found"}},
 )
 async def switch_conversation_llm(
+    request: Request,
     conversation_id: UUID,
     llm: LLM = Body(..., embed=True),  # noqa: B008
     conversation_service: ConversationService = Depends(get_conversation_service),
@@ -337,6 +339,9 @@ async def switch_conversation_llm(
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     conversation = event_service.get_conversation()
+    cipher = get_cipher(request)
+    if cipher is not None:
+        llm = decrypt_incoming_llm_secrets(llm, cipher)
     conversation.switch_llm(llm)
     return Success()
 
