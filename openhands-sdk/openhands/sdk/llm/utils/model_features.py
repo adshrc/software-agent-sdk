@@ -91,13 +91,13 @@ EXTENDED_THINKING_MODELS: list[str] = [
     # We did not include sonnet 3.7 and 4 here as they don't brings
     # significant performance improvements for agents
     "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
     "claude-haiku-4-5",
-    # Opus 4.8 is a reasoning model: Anthropic rejects requests with
-    # `temperature`/`top_p` ("`temperature` is deprecated for this model"),
-    # so it must go through the extended-thinking path which strips those
-    # params and enables the thinking budget header.
-    "claude-opus-4-8",
+    # Claude 4.6+ models (sonnet-4-6, opus-4-7, opus-4-8, …) use Anthropic's
+    # adaptive-thinking API (thinking.type="adaptive" + output_config.effort)
+    # instead of the classic extended-thinking API (thinking.type="enabled" +
+    # budget_tokens).  They are handled by the reasoning_effort path in
+    # select_chat_options, which litellm maps to the correct adaptive params.
+    # Do NOT add them here — the hardcoded type="enabled" would conflict.
 ]
 
 PROMPT_CACHE_MODELS: list[str] = [

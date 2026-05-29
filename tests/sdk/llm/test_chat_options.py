@@ -151,19 +151,24 @@ def test_claude_opus_4_8_strips_temp_and_top_p():
     """Test that claude-opus-4-8 strips temperature and top_p.
 
     Anthropic rejects requests to Claude Opus 4.8 with `temperature`/`top_p`:
-    ``"`temperature` is deprecated for this model."``. Routing the model
-    through the extended-thinking path strips both params (and enables the
-    thinking budget header) so requests succeed.
+    ``"`temperature` is deprecated for this model."``. The reasoning_effort
+    path (supports_reasoning_effort=True) strips both params for non-Gemini
+    reasoning models.
     """
     llm = DummyLLM(
         model="litellm_proxy/anthropic/claude-opus-4-8",
         top_p=1.0,  # SDK default
         temperature=0.0,  # Often overridden by benchmarks (e.g. SWE-bench)
+        reasoning_effort="high",  # LLM default
     )
     out = select_chat_options(llm, user_kwargs={}, has_tools=True)
 
     assert "temperature" not in out
     assert "top_p" not in out
+    # Claude 4.6+ uses adaptive thinking via reasoning_effort, not
+    # the extended-thinking path — no hardcoded thinking dict should appear
+    assert "thinking" not in out
+    assert out.get("reasoning_effort") == "high"
 
 
 def test_extended_thinking_budget_clamped_below_max_tokens():

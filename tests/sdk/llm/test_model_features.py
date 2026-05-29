@@ -77,17 +77,19 @@ def test_reasoning_effort_support(model, expected_reasoning):
 @pytest.mark.parametrize(
     "model,expected_extended_thinking",
     [
-        # Anthropic extended thinking models
+        # Anthropic extended thinking models (classic type="enabled" API)
         ("claude-sonnet-4-5", True),
-        ("claude-sonnet-4-6", True),
         ("claude-haiku-4-5", True),
-        ("claude-opus-4-8", True),
         # Provider prefixed variants
         ("anthropic/claude-sonnet-4-5", True),
-        ("anthropic/claude-sonnet-4-6", True),
         ("anthropic/claude-haiku-4-5", True),
-        ("anthropic/claude-opus-4-8", True),
-        ("litellm_proxy/anthropic/claude-opus-4-8", True),
+        # Claude 4.6+ uses adaptive thinking (type="adaptive"), handled by
+        # reasoning_effort path — NOT in EXTENDED_THINKING_MODELS
+        ("claude-sonnet-4-6", False),
+        ("claude-opus-4-8", False),
+        ("anthropic/claude-sonnet-4-6", False),
+        ("anthropic/claude-opus-4-8", False),
+        ("litellm_proxy/anthropic/claude-opus-4-8", False),
         # Models that don't support extended thinking
         ("claude-3-7-sonnet", False),
         ("claude-sonnet-4", False),
